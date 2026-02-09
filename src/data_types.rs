@@ -52,7 +52,6 @@ macro_rules! impl_dlpack_pointer_cast {
 
                 // Allow storage aliases: u8 for Bool, u16 for Float16
                 let is_alias = match (stringify!($type), data_type.code) {
-                    ("u8", DLDataTypeCode::kDLBool) => true,
                     ("u16", DLDataTypeCode::kDLFloat) => true,
                     _ => false,
                 };
