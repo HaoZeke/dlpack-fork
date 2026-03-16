@@ -11,25 +11,34 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 
-use ouroboros::self_referencing;
-
 use crate::sys;
 use crate::{DLPackTensor, GetDLPackDataType};
 
 use crate::vec::DLPackVecError;
 
-#[self_referencing]
-struct ManagerContextMutex<T> where T: 'static {
-    array: Arc<Mutex<Vec<T>>>,
-    #[borrows(array)]
-    #[covariant]
-    lock: MutexGuard<'this, Vec<T>>,
+// The ManagerContext structs below are self-referential: the guard borrows from
+// the Arc. This is safe because:
+//
+// 1. MutexGuard/RwLockWriteGuard internally hold a reference to the Mutex/RwLock
+//    inside the Arc, which is heap-allocated. Moving the Arc (a pointer) does not
+//    invalidate the guard.
+// 2. The guard field is declared BEFORE the arc field, so Rust's field drop order
+//    guarantees the guard drops first (releasing the lock) before the Arc drops.
+// 3. The struct is heap-allocated (Box) in the manager context and never moved.
+//
+// We use std::mem::transmute to extend the guard's lifetime to 'static. This is
+// the standard pattern for self-referential structs where the borrow target is
+// heap-allocated and outlives the borrower.
+
+struct ManagerContextMutex<T: 'static> {
+    // IMPORTANT: guard MUST be declared before arc so it drops first.
+    guard: MutexGuard<'static, Vec<T>>,
+    _arc: Arc<Mutex<Vec<T>>>,
     shape: i64,
     stride: i64,
 }
 
 unsafe extern "C" fn mutex_deleter_fn<T>(manager: *mut sys::DLManagedTensorVersioned) where T: 'static {
-    // Reconstruct the box and drop it, freeing the memory.
     let ctx = (*manager).manager_ctx.cast::<ManagerContextMutex<T>>();
     let _ = Box::from_raw(ctx);
 }
@@ -38,36 +47,25 @@ impl<T> TryFrom<Arc<Mutex<Vec<T>>>> for DLPackTensor where T: GetDLPackDataType 
     type Error = DLPackVecError;
 
     fn try_from(array: Arc<Mutex<Vec<T>>>) -> Result<DLPackTensor, Self::Error> {
-        let shape = array.lock()?.len() as i64;
+        let guard = array.lock()?;
+        let shape = guard.len() as i64;
 
-        let ctx = ManagerContextMutexBuilder {
-            array: array,
-            lock_builder: move |array| { array.lock().expect("could not lock the mutex") },
-            shape: shape,
+        // SAFETY: see module-level comment on self-referential safety.
+        let guard: MutexGuard<'static, Vec<T>> = unsafe { std::mem::transmute(guard) };
+
+        let mut ctx = Box::new(ManagerContextMutex {
+            guard,
+            _arc: array,
+            shape,
             stride: 1,
-        };
-        let mut ctx = Box::new(ctx.build());
-
-        let mut shape_ptr = std::ptr::null_mut();
-        ctx.with_shape_mut(|shape| {
-            shape_ptr = shape as *mut i64;
         });
 
-        let mut stride_ptr = std::ptr::null_mut();
-        ctx.with_stride_mut(|stride| {
-            stride_ptr = stride as *mut i64;
-        });
-
-        let mut data = std::ptr::null_mut();
-        ctx.with_lock_mut(|lock| {
-            // We can give out a mutable pointer to the data because the lock
-            // will be held until the `DLPackTensor` is dropped, so the data
-            // won't be modified by Rust while it's used by DLPack.
-            data = lock.as_mut_ptr().cast()
-        });
+        let shape_ptr = &mut ctx.shape as *mut i64;
+        let stride_ptr = &mut ctx.stride as *mut i64;
+        let data = ctx.guard.as_mut_ptr().cast();
 
         let dl_tensor = sys::DLTensor {
-            data: data,
+            data,
             device: sys::DLDevice {
                 device_type: sys::DLDeviceType::kDLCPU,
                 device_id: 0,
@@ -93,18 +91,15 @@ impl<T> TryFrom<Arc<Mutex<Vec<T>>>> for DLPackTensor where T: GetDLPackDataType 
     }
 }
 
-#[self_referencing]
-struct ManagerContextRwLock<T> where T: 'static {
-    array: Arc<RwLock<Vec<T>>>,
-    #[borrows(array)]
-    #[covariant]
-    lock: RwLockWriteGuard<'this, Vec<T>>,
+struct ManagerContextRwLock<T: 'static> {
+    // IMPORTANT: guard MUST be declared before arc so it drops first.
+    guard: RwLockWriteGuard<'static, Vec<T>>,
+    _arc: Arc<RwLock<Vec<T>>>,
     shape: i64,
     stride: i64,
 }
 
 unsafe extern "C" fn rwlock_deleter_fn<T>(manager: *mut sys::DLManagedTensorVersioned) where T: 'static {
-    // Reconstruct the box and drop it, freeing the memory.
     let ctx = (*manager).manager_ctx.cast::<ManagerContextRwLock<T>>();
     let _ = Box::from_raw(ctx);
 }
@@ -113,36 +108,25 @@ impl<T> TryFrom<Arc<RwLock<Vec<T>>>> for DLPackTensor where T: GetDLPackDataType
     type Error = DLPackVecError;
 
     fn try_from(array: Arc<RwLock<Vec<T>>>) -> Result<DLPackTensor, Self::Error> {
-        let shape = array.read()?.len() as i64;
+        let guard = array.write()?;
+        let shape = guard.len() as i64;
 
-        let ctx = ManagerContextRwLockBuilder {
-            array: array,
-            lock_builder: move |array| { array.write().expect("could not lock the rwlock") },
-            shape: shape,
+        // SAFETY: see module-level comment on self-referential safety.
+        let guard: RwLockWriteGuard<'static, Vec<T>> = unsafe { std::mem::transmute(guard) };
+
+        let mut ctx = Box::new(ManagerContextRwLock {
+            guard,
+            _arc: array,
+            shape,
             stride: 1,
-        };
-        let mut ctx = Box::new(ctx.build());
-
-        let mut shape_ptr = std::ptr::null_mut();
-        ctx.with_shape_mut(|shape| {
-            shape_ptr = shape as *mut i64;
         });
 
-        let mut stride_ptr = std::ptr::null_mut();
-        ctx.with_stride_mut(|stride| {
-            stride_ptr = stride as *mut i64;
-        });
-
-        let mut data = std::ptr::null_mut();
-        ctx.with_lock_mut(|lock| {
-            // We can give out a mutable pointer to the data because the lock
-            // will be held until the `DLPackTensor` is dropped, so the data
-            // won't be modified by Rust while it's used by DLPack.
-            data = lock.as_mut_ptr().cast()
-        });
+        let shape_ptr = &mut ctx.shape as *mut i64;
+        let stride_ptr = &mut ctx.stride as *mut i64;
+        let data = ctx.guard.as_mut_ptr().cast();
 
         let dl_tensor = sys::DLTensor {
-            data: data,
+            data,
             device: sys::DLDevice {
                 device_type: sys::DLDeviceType::kDLCPU,
                 device_id: 0,
