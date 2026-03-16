@@ -12,12 +12,12 @@
 //! - Vec<T> -> DLPackTensor, creating a DLPack tensor which owns its data.
 //! - Box<[T]> -> DLPackTensor, creating a DLPack tensor which owns its data.
 
-use crate::data_types::{CastError, DLPackPointerCast, GetDLPackDataType};
 use crate::sys;
 use crate::{DLPackTensor, DLPackTensorRef, DLPackTensorRefMut};
+use crate::{CastError, DLPackPointerCast, GetDLPackDataType};
 
 /// Possible error causes when converting between Vec/slice and DLPack
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub enum DLPackVecError {
     /// We only support data which lives on CPU
     DeviceShouldBeCpu(sys::DLDevice),
@@ -25,6 +25,8 @@ pub enum DLPackVecError {
     InvalidType(CastError),
     /// The shape/stride of the data does not match expectations
     ShapeError(Vec<i64>),
+    /// A Mutex/RwLock was poisoned while trying to lock it
+    PoisonError(String),
 }
 
 impl std::fmt::Display for DLPackVecError {
@@ -39,6 +41,9 @@ impl std::fmt::Display for DLPackVecError {
             DLPackVecError::ShapeError(shape) => {
                 write!(f, "shape error, expected a 1D array, got shape: {:?}", shape)
             }
+            DLPackVecError::PoisonError(error) => {
+                write!(f, "mutex/rwlock poisoned: {}", error)
+            }
         }
     }
 }
@@ -47,8 +52,9 @@ impl std::error::Error for DLPackVecError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             DLPackVecError::DeviceShouldBeCpu(_) => None,
-            DLPackVecError::InvalidType(cast_error) => Some(cast_error),
+            DLPackVecError::InvalidType(e) => Some(e),
             DLPackVecError::ShapeError(_) => None,
+            DLPackVecError::PoisonError(_) => None,
         }
     }
 }
@@ -56,6 +62,24 @@ impl std::error::Error for DLPackVecError {
 impl From<CastError> for DLPackVecError {
     fn from(value: CastError) -> Self {
         DLPackVecError::InvalidType(value)
+    }
+}
+
+impl<'a, T> From<std::sync::PoisonError<std::sync::MutexGuard<'a, T>>> for DLPackVecError {
+    fn from(value: std::sync::PoisonError<std::sync::MutexGuard<'a, T>>) -> Self {
+        DLPackVecError::PoisonError(value.to_string())
+    }
+}
+
+impl<'a, T> From<std::sync::PoisonError<std::sync::RwLockWriteGuard<'a, T>>> for DLPackVecError {
+    fn from(value: std::sync::PoisonError<std::sync::RwLockWriteGuard<'a, T>>) -> Self {
+        DLPackVecError::PoisonError(value.to_string())
+    }
+}
+
+impl<'a, T> From<std::sync::PoisonError<std::sync::RwLockReadGuard<'a, T>>> for DLPackVecError {
+    fn from(value: std::sync::PoisonError<std::sync::RwLockReadGuard<'a, T>>) -> Self {
+        DLPackVecError::PoisonError(value.to_string())
     }
 }
 
@@ -236,6 +260,11 @@ mod tests {
         let tensor: DLPackTensor = data.try_into().unwrap();
 
         let err = TryInto::<Vec<f64>>::try_into(tensor).unwrap_err();
-        assert_eq!(err, DLPackVecError::ShapeError(vec![2, 2]));
+        match err {
+             DLPackVecError::ShapeError(shape) => {
+                assert_eq!(shape, [2, 2]);
+            }
+            _ => panic!("unexpected error: {}", err),
+        }
     }
 }
