@@ -52,16 +52,20 @@ where
             std::mem::transmute(guard)
         };
 
-        let mut ctx = Box::new(ManagerContextRwLock {
+        let ctx = Box::new(ManagerContextRwLock {
             guard,
             _arc: array,
             shape,
             strides,
         });
 
-        let shape_ptr = ctx.shape.as_mut_ptr();
-        let stride_ptr = ctx.strides.as_mut_ptr();
-        let data = ctx.guard.as_mut_ptr().cast();
+        // SAFETY: Convert to raw pointer FIRST, then derive all field pointers
+        // from it. This avoids Stacked Borrows violations where Box::into_raw
+        // would invalidate pointers obtained from the Box.
+        let ctx_ptr = Box::into_raw(ctx);
+        let shape_ptr = unsafe { (*ctx_ptr).shape.as_mut_ptr() };
+        let stride_ptr = unsafe { (*ctx_ptr).strides.as_mut_ptr() };
+        let data = unsafe { (*ctx_ptr).guard.as_mut_ptr().cast() };
 
         let dl_tensor = sys::DLTensor {
             data,
@@ -78,7 +82,7 @@ where
 
         let managed_tensor = sys::DLManagedTensorVersioned {
             version: sys::DLPackVersion::current(),
-            manager_ctx: Box::into_raw(ctx).cast(),
+            manager_ctx: ctx_ptr.cast(),
             deleter: Some(rwlock_deleter_fn::<Array<T, D>>),
             flags: 0,
             dl_tensor,
@@ -122,16 +126,17 @@ where
             std::mem::transmute(guard)
         };
 
-        let mut ctx = Box::new(ManagerContextMutex {
+        let ctx = Box::new(ManagerContextMutex {
             guard,
             _arc: array,
             shape,
             strides,
         });
 
-        let shape_ptr = ctx.shape.as_mut_ptr();
-        let stride_ptr = ctx.strides.as_mut_ptr();
-        let data = ctx.guard.as_mut_ptr().cast();
+        let ctx_ptr = Box::into_raw(ctx);
+        let shape_ptr = unsafe { (*ctx_ptr).shape.as_mut_ptr() };
+        let stride_ptr = unsafe { (*ctx_ptr).strides.as_mut_ptr() };
+        let data = unsafe { (*ctx_ptr).guard.as_mut_ptr().cast() };
 
         let dl_tensor = sys::DLTensor {
             data,
@@ -148,7 +153,7 @@ where
 
         let managed_tensor = sys::DLManagedTensorVersioned {
             version: sys::DLPackVersion::current(),
-            manager_ctx: Box::into_raw(ctx).cast(),
+            manager_ctx: ctx_ptr.cast(),
             deleter: Some(mutex_deleter_fn::<Array<T, D>>),
             flags: 0,
             dl_tensor,
@@ -200,5 +205,23 @@ mod tests {
 
         let array = array.read().unwrap();
         assert_eq!(*array, arr2(&[[1.0, 2.0, 3.0], [4.0, 42.0, 6.0]]));
+    }
+
+    /// When the DLPackTensor holds the LAST Arc reference, the deleter must
+    /// deallocate the inner Array correctly. This catches type parameter
+    /// mismatches in the deleter function (e.g. using element type T instead
+    /// of the full Array<T, D>).
+    #[test]
+    fn test_mutex_last_arc_ref() {
+        let array = Arc::new(Mutex::new(arr2(&[[1.0, 2.0], [3.0, 4.0]])));
+        let tensor: DLPackTensor = array.try_into().unwrap();
+        drop(tensor);
+    }
+
+    #[test]
+    fn test_rwlock_last_arc_ref() {
+        let array = Arc::new(RwLock::new(arr2(&[[1.0, 2.0], [3.0, 4.0]])));
+        let tensor: DLPackTensor = array.try_into().unwrap();
+        drop(tensor);
     }
 }

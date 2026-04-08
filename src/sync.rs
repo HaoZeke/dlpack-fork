@@ -53,16 +53,20 @@ impl<T> TryFrom<Arc<Mutex<Vec<T>>>> for DLPackTensor where T: GetDLPackDataType 
         // SAFETY: see module-level comment on self-referential safety.
         let guard: MutexGuard<'static, Vec<T>> = unsafe { std::mem::transmute(guard) };
 
-        let mut ctx = Box::new(ManagerContextMutex {
+        let ctx = Box::new(ManagerContextMutex {
             guard,
             _arc: array,
             shape,
             stride: 1,
         });
 
-        let shape_ptr = &mut ctx.shape as *mut i64;
-        let stride_ptr = &mut ctx.stride as *mut i64;
-        let data = ctx.guard.as_mut_ptr().cast();
+        // SAFETY: Convert to raw pointer FIRST, then derive all field pointers
+        // from it. This avoids Stacked Borrows violations where Box::into_raw
+        // would invalidate pointers obtained from the Box.
+        let ctx_ptr = Box::into_raw(ctx);
+        let shape_ptr = unsafe { std::ptr::addr_of_mut!((*ctx_ptr).shape) };
+        let stride_ptr = unsafe { std::ptr::addr_of_mut!((*ctx_ptr).stride) };
+        let data = unsafe { (*ctx_ptr).guard.as_mut_ptr().cast() };
 
         let dl_tensor = sys::DLTensor {
             data,
@@ -79,7 +83,7 @@ impl<T> TryFrom<Arc<Mutex<Vec<T>>>> for DLPackTensor where T: GetDLPackDataType 
 
         let managed_tensor = sys::DLManagedTensorVersioned {
             version: sys::DLPackVersion::current(),
-            manager_ctx: Box::into_raw(ctx).cast(),
+            manager_ctx: ctx_ptr.cast(),
             deleter: Some(mutex_deleter_fn::<T>),
             flags: 0,
             dl_tensor,
@@ -114,16 +118,17 @@ impl<T> TryFrom<Arc<RwLock<Vec<T>>>> for DLPackTensor where T: GetDLPackDataType
         // SAFETY: see module-level comment on self-referential safety.
         let guard: RwLockWriteGuard<'static, Vec<T>> = unsafe { std::mem::transmute(guard) };
 
-        let mut ctx = Box::new(ManagerContextRwLock {
+        let ctx = Box::new(ManagerContextRwLock {
             guard,
             _arc: array,
             shape,
             stride: 1,
         });
 
-        let shape_ptr = &mut ctx.shape as *mut i64;
-        let stride_ptr = &mut ctx.stride as *mut i64;
-        let data = ctx.guard.as_mut_ptr().cast();
+        let ctx_ptr = Box::into_raw(ctx);
+        let shape_ptr = unsafe { std::ptr::addr_of_mut!((*ctx_ptr).shape) };
+        let stride_ptr = unsafe { std::ptr::addr_of_mut!((*ctx_ptr).stride) };
+        let data = unsafe { (*ctx_ptr).guard.as_mut_ptr().cast() };
 
         let dl_tensor = sys::DLTensor {
             data,
@@ -140,7 +145,7 @@ impl<T> TryFrom<Arc<RwLock<Vec<T>>>> for DLPackTensor where T: GetDLPackDataType
 
         let managed_tensor = sys::DLManagedTensorVersioned {
             version: sys::DLPackVersion::current(),
-            manager_ctx: Box::into_raw(ctx).cast(),
+            manager_ctx: ctx_ptr.cast(),
             deleter: Some(rwlock_deleter_fn::<T>),
             flags: 0,
             dl_tensor,
